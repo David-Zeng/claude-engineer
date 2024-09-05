@@ -18,6 +18,7 @@ import aiohttp
 from prompt_toolkit import PromptSession
 from prompt_toolkit.styles import Style
 import difflib
+import glob
 
 async def get_user_input(prompt="You: "):
     style = Style.from_dict({
@@ -128,7 +129,7 @@ You are Claude, an AI assistant powered by Anthropic's Claude-3.5-Sonnet model, 
 
 Available tools and their optimal use cases:
 
-1. create_folders: Create new directories in the project structure.
+1. create_folders: Create new folders at the specified paths, including nested directories. Use this to create one or more directories in the project structure, even complex nested structures in a single operation.
 2. create_files: Generate one or more new files with specified content. Strive to make the files as complete and useful as possible.
 3. edit_and_apply_multiple: Examine and modify one or more existing files by instructing a separate AI coding agent. You are responsible for providing clear, detailed instructions for each file. When using this tool:
    - Provide comprehensive context about the project, including recent changes, new variables or functions, and how files are interconnected.
@@ -138,7 +139,7 @@ Available tools and their optimal use cases:
    - Anticipate potential issues or conflicts that might arise from the changes and provide guidance on how to handle them.
 4. execute_code: Run Python code exclusively in the 'code_execution_env' virtual environment and analyze its output. Use this when you need to test code functionality or diagnose issues. Remember that all code execution happens in this isolated environment. This tool returns a process ID for long-running processes.
 5. stop_process: Stop a running process by its ID. Use this when you need to terminate a long-running process started by the execute_code tool.
-6. read_multiple_files: Read the contents of one or more existing files at once. This tool now handles both single and multiple file reads. Use this when you need to examine or work with file contents.
+6. read_multiple_files: Read the contents of one or more existing files, supporting wildcards (e.g., '*.py') and recursive directory reading. This tool can handle single or multiple file paths, directory paths, and wildcard patterns. Use this when you need to examine or work with file contents, especially for multiple files or entire directories.
 7. list_files: List all files and directories in a specified folder.
 8. tavily_search: Perform a web search using the Tavily API for up-to-date information.
 9. Scan project folders to turn them into an .md file for better context.
@@ -191,6 +192,43 @@ You are currently in automode. Follow these guidelines:
    - Provide regular updates on goal completion and overall progress.
    - Use the iteration information to pace your work effectively.
 
+Break Down Complex Tasks:
+When faced with a complex task or project, break it down into smaller, manageable steps. Provide a clear outline of the steps involved, potential challenges, and how to approach each part of the task.
+
+Prefer Answering Without Code:
+When explaining concepts or providing solutions, prioritize clear explanations and pseudocode over full code implementations. Only provide full code snippets when explicitly requested or when it's essential for understanding.
+
+Code Review Process:
+When reviewing code, follow these steps:
+1. Understand the context and purpose of the code
+2. Check for clarity and readability
+3. Identify potential bugs or errors
+4. Suggest optimizations or improvements
+5. Ensure adherence to best practices and coding standards
+6. Consider security implications
+7. Provide constructive feedback with explanations
+
+Project Planning:
+When planning a project, consider the following:
+1. Define clear project goals and objectives
+2. Break down the project into manageable tasks and subtasks
+3. Estimate time and resources required for each task
+4. Identify potential risks and mitigation strategies
+5. Suggest appropriate tools and technologies
+6. Outline a testing and quality assurance strategy
+7. Consider scalability and future maintenance
+
+Security Review:
+When conducting a security review, focus on:
+1. Identifying potential vulnerabilities in the code
+2. Checking for proper input validation and sanitization
+3. Ensuring secure handling of sensitive data
+4. Reviewing authentication and authorization mechanisms
+5. Checking for secure communication protocols
+6. Identifying any use of deprecated or insecure functions
+7. Suggesting security best practices and improvements
+
+Remember to apply these additional skills and processes when assisting users with their software development tasks and projects.
 4. Tool Usage:
    - Leverage all available tools to accomplish your goals efficiently.
    - Prefer edit_and_apply_multiple for file modifications, applying changes in chunks for large edits.
@@ -215,12 +253,13 @@ Remember: Focus on completing the established goals efficiently and effectively.
 def update_system_prompt(current_iteration: Optional[int] = None, max_iterations: Optional[int] = None) -> str:
     global file_contents
     chain_of_thought_prompt = """
-    Answer the user's request using relevant tools (if they are available). Before calling a tool, do some analysis within <thinking></thinking> tags. First, think about which of the provided tools is the relevant tool to answer the user's request. Second, go through each of the required parameters of the relevant tool and determine if the user has directly provided or given enough information to infer a value. When deciding if the parameter can be inferred, carefully consider all the context to see if it supports a specific value. If all of the required parameters are present or can be reasonably inferred, close the thinking tag and proceed with the tool call. BUT, if one of the values for a required parameter is missing, DO NOT invoke the function (not even with fillers for the missing params) and instead, ask the user to provide the missing parameters. DO NOT ask for more information on optional parameters if it is not provided.
-
-    Do not reflect on the quality of the returned search results in your response.
+    IMPORTANT: Before using the read_multiple_files tool, always check if the files you need are already in your context (system prompt).
+    If the file contents are already available to you, use that information directly instead of calling the read_multiple_files tool.
+    Only use the read_multiple_files tool for files that are not already in your context.
     """
 
-    file_contents_prompt = "\n\nFile Contents:\n"
+    files_in_context = "\n".join(file_contents.keys())
+    file_contents_prompt = f"\n\nFiles already in your context:\n{files_in_context}\n\nFile Contents:\n"
     for path, content in file_contents.items():
         file_contents_prompt += f"\n--- {path} ---\n{content}\n"
 
@@ -236,10 +275,11 @@ def create_folders(paths):
     results = []
     for path in paths:
         try:
+            # Use os.makedirs with exist_ok=True to create nested directories
             os.makedirs(path, exist_ok=True)
-            results.append(f"Folder created: {path}")
+            results.append(f"Folder(s) created: {path}")
         except Exception as e:
-            results.append(f"Error creating folder {path}: {str(e)}")
+            results.append(f"Error creating folder(s) {path}: {str(e)}")
     return "\n".join(results)
 
 def create_files(files):
@@ -564,6 +604,7 @@ def generate_diff(original, new, path):
 
     return highlighted_diff
 
+
 async def execute_code(code, timeout=10):
     global running_processes
     venv_path, activate_script = setup_virtual_environment()
@@ -609,24 +650,38 @@ async def execute_code(code, timeout=10):
     return process_id, execution_result
 
 # Update the read_multiple_files function to handle both single and multiple files
-def read_multiple_files(paths):
+def read_multiple_files(paths, recursive=False):
     global file_contents
     results = []
 
-    # Convert single path to list if necessary
     if isinstance(paths, str):
         paths = [paths]
-    elif paths is None:
-        return "Error: No file paths provided"
 
     for path in paths:
         try:
-            with open(path, 'r') as f:
-                content = f.read()
-            file_contents[path] = content
-            results.append(f"File '{path}' has been read and stored in the system prompt.")
+            if os.path.isdir(path):
+                if recursive:
+                    file_paths = glob.glob(os.path.join(path, '**', '*'), recursive=True)
+                else:
+                    file_paths = glob.glob(os.path.join(path, '*'))
+                file_paths = [f for f in file_paths if os.path.isfile(f)]
+            else:
+                file_paths = glob.glob(path, recursive=recursive)
+
+            for file_path in file_paths:
+                if os.path.isfile(file_path):
+                    if file_path not in file_contents:
+                        with open(file_path, 'r', encoding='utf-8') as f:
+                            content = f.read()
+                        file_contents[file_path] = content
+                        results.append(f"File '{file_path}' has been read and stored in the system prompt.")
+                    else:
+                        results.append(f"File '{file_path}' is already in the system prompt. No need to read again.")
+                else:
+                    results.append(f"Skipped '{file_path}': Not a file.")
         except Exception as e:
-            results.append(f"Error reading file '{path}': {str(e)}")
+            results.append(f"Error reading path '{path}': {str(e)}")
+
     return "\n".join(results)
 
 def list_files(path="."):
@@ -660,7 +715,7 @@ def stop_process(process_id):
 tools = [
     {
         "name": "create_folders",
-        "description": "Create new folders at the specified paths. This tool should be used when you need to create one or more directories in the project structure. It will create all necessary parent directories if they don't exist.",
+        "description": "Create new folders at the specified paths, including nested directories. This tool should be used when you need to create one or more directories (including nested ones) in the project structure. It will create all necessary parent directories if they don't exist.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -669,7 +724,7 @@ tools = [
                     "items": {
                         "type": "string"
                     },
-                    "description": "An array of absolute or relative paths where the folders should be created. Use forward slashes (/) for path separation, even on Windows systems."
+                    "description": "An array of absolute or relative paths where the folders should be created. Use forward slashes (/) for path separation, even on Windows systems. For nested directories, simply include the full path (e.g., 'parent/child/grandchild')."
                 }
             },
             "required": ["paths"]
@@ -780,7 +835,7 @@ tools = [
     },
     {
         "name": "read_multiple_files",
-        "description": "Read the contents of one or more existing files at once. This tool now handles both single and multiple file reads. Use this when you need to examine or work with file contents.",
+        "description": "Read the contents of one or more existing files, supporting wildcards and recursive directory reading.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -788,17 +843,22 @@ tools = [
                     "oneOf": [
                         {
                             "type": "string",
-                            "description": "The absolute or relative path of a single file to read."
+                            "description": "A single file path, directory path, or wildcard pattern."
                         },
                         {
                             "type": "array",
                             "items": {
                                 "type": "string"
                             },
-                            "description": "An array of absolute or relative paths of the files to read."
+                            "description": "An array of file paths, directory paths, or wildcard patterns."
                         }
                     ],
-                    "description": "The path(s) of the file(s) to read. Use forward slashes (/) for path separation, even on Windows systems."
+                    "description": "The path(s) of the file(s) to read. Use forward slashes (/) for path separation, even on Windows systems. Supports wildcards (e.g., '*.py') and directory paths."
+                },
+                "recursive": {
+                    "type": "boolean",
+                    "description": "If true, read files recursively from directories. Default is false.",
+                    "default": False
                 }
             },
             "required": ["paths"]
@@ -891,7 +951,17 @@ async def execute_tool(tool_name: str, tool_input: Dict[str, Any]) -> Dict[str, 
         elif tool_name == "create_folders":
             result = create_folders(tool_input["paths"])
         elif tool_name == "read_multiple_files":
-            paths = tool_input.get("paths", tool_input.get("path"))
+            paths = tool_input.get("paths")
+            recursive = tool_input.get("recursive", False)
+            if paths is None:
+                result = "Error: No file paths provided"
+                is_error = True
+            else:
+                files_to_read = [p for p in (paths if isinstance(paths, list) else [paths]) if p not in file_contents]
+                if not files_to_read:
+                    result = "All requested files are already in the system prompt. No need to read from disk."
+                else:
+                    result = read_multiple_files(files_to_read, recursive)
             if paths is None:
                 result = "Error: No file paths provided"
                 is_error = True
