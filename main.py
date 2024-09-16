@@ -30,15 +30,14 @@ from typing import Tuple, Optional, Dict, Any
 import mimetypes
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
 import subprocess
+import shutil
+from typing import AsyncIterable
 
 # Configure logging
 logging.basicConfig(level=logging.ERROR, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Load environment variables from .env file
 load_dotenv()
-
-# Create a recognizer object
-recognizer = sr.Recognizer()
 
 # Define a list of voice commands
 VOICE_COMMANDS = {
@@ -47,8 +46,7 @@ VOICE_COMMANDS = {
     "reset conversation": "reset_conversation"
 }
 
-
-# Global variables
+# Initialize recognizer and microphone as None
 recognizer = None
 microphone = None
 
@@ -56,59 +54,108 @@ microphone = None
 tts_enabled = True
 use_tts = False
 ELEVEN_LABS_API_KEY = os.getenv('ELEVEN_LABS_API_KEY')
-VOICE_ID = 'YOUR ID'
+VOICE_ID = 'YOUR VOICE ID'
 MODEL_ID = 'eleven_turbo_v2_5'
 
+def is_installed(lib_name):
+    return shutil.which(lib_name) is not None
+
+async def text_chunker(text: str) -> AsyncIterable[str]:
+    """Split text into chunks, ensuring to not break sentences."""
+    splitters = (".", ",", "?", "!", ";", ":", "—", "-", "(", ")", "[", "]", "}", " ")
+    buffer = ""
+    
+    for char in text:
+        if buffer.endswith(splitters):
+            yield buffer + " "
+            buffer = char
+        elif char in splitters:
+            yield buffer + char + " "
+            buffer = ""
+        else:
+            buffer += char
+
+    if buffer:
+        yield buffer + " "
+
+async def stream_audio(audio_stream):
+    """Stream audio data using mpv player."""
+    if not is_installed("mpv"):
+        console.print("mpv not found. Installing alternative audio playback...", style="bold yellow")
+        # Fall back to pydub playback if mpv is not available
+        audio_data = b''.join([chunk async for chunk in audio_stream])
+        audio = AudioSegment.from_mp3(io.BytesIO(audio_data))
+        play(audio)
+        return
+
+    mpv_process = subprocess.Popen(
+        ["mpv", "--no-cache", "--no-terminal", "--", "fd://0"],
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+    console.print("Started streaming audio", style="bold green")
+    try:
+        async for chunk in audio_stream:
+            if chunk:
+                mpv_process.stdin.write(chunk)
+                mpv_process.stdin.flush()
+    except Exception as e:
+        console.print(f"Error during audio streaming: {str(e)}", style="bold red")
+    finally:
+        if mpv_process.stdin:
+            mpv_process.stdin.close()
+        mpv_process.wait()
 
 async def text_to_speech(text):
     if not ELEVEN_LABS_API_KEY:
         console.print("ElevenLabs API key not found. Text-to-speech is disabled.", style="bold yellow")
-        console.print("Fallback: Printing the text instead.", style="bold yellow")
         console.print(text)
         return
 
     uri = f"wss://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}/stream-input?model_id={MODEL_ID}"
     
-    async def chunk_text(text):
-        sentences = re.split('(?<=[.,?!;:—\-()[\]{}]) +', text)
-        for sentence in sentences:
-            yield sentence + " "
-
     try:
-        logging.info("Connecting to ElevenLabs API")
         async with websockets.connect(uri, extra_headers={'xi-api-key': ELEVEN_LABS_API_KEY}) as websocket:
-            logging.info("Connected to ElevenLabs API")
+            # Send initial message
             await websocket.send(json.dumps({
                 "text": " ",
                 "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
                 "xi_api_key": ELEVEN_LABS_API_KEY,
             }))
 
-            audio_stream = AudioSegment.empty()
-            async for chunk in chunk_text(text):
-                logging.debug(f"Sending chunk: {chunk}")
-                await websocket.send(json.dumps({"text": chunk, "try_trigger_generation": True}))
-
-            await websocket.send(json.dumps({"text": ""}))  # Closing message
-            logging.info("Sent all text chunks")
-
-            while True:
-                try:
-                    message = await websocket.recv()
-                    data = json.loads(message)
-                    if data.get('audio'):
-                        audio_data = base64.b64decode(data['audio'])
-                        audio_chunk = AudioSegment.from_mp3(io.BytesIO(audio_data))
-                        audio_stream += audio_chunk
-                        play(audio_chunk)  # Play each chunk as it's received
-                        logging.debug("Played audio chunk")
-                    elif data.get('isFinal'):
-                        logging.info("Received final message")
+            # Set up listener for audio chunks
+            async def listen():
+                while True:
+                    try:
+                        message = await websocket.recv()
+                        data = json.loads(message)
+                        if data.get("audio"):
+                            yield base64.b64decode(data["audio"])
+                        elif data.get('isFinal'):
+                            break
+                    except websockets.exceptions.ConnectionClosed:
+                        logging.error("WebSocket connection closed unexpectedly")
                         break
-                except websockets.exceptions.ConnectionClosed:
-                    logging.error("WebSocket connection closed unexpectedly")
-                    console.print("WebSocket connection closed unexpectedly", style="bold red")
+                    except Exception as e:
+                        logging.error(f"Error processing audio message: {str(e)}")
+                        break
+
+            # Start audio streaming task
+            stream_task = asyncio.create_task(stream_audio(listen()))
+
+            # Send text in chunks
+            async for chunk in text_chunker(text):
+                try:
+                    await websocket.send(json.dumps({"text": chunk, "try_trigger_generation": True}))
+                except Exception as e:
+                    logging.error(f"Error sending text chunk: {str(e)}")
                     break
+
+            # Send closing message
+            await websocket.send(json.dumps({"text": ""}))
+
+            # Wait for streaming to complete
+            await stream_task
 
     except websockets.exceptions.InvalidStatusCode as e:
         logging.error(f"Failed to connect to ElevenLabs API: {e}")
@@ -196,9 +243,6 @@ async def get_user_input(prompt="You: "):
     session = PromptSession(style=style)
     return await session.prompt_async(prompt, multiline=False)
 
-
-
-
 def setup_virtual_environment() -> Tuple[str, str]:
     venv_name = "code_execution_env"
     venv_path = os.path.join(os.getcwd(), venv_name)
@@ -217,9 +261,6 @@ def setup_virtual_environment() -> Tuple[str, str]:
         logging.error(f"Error setting up virtual environment: {str(e)}")
         raise
 
-
-
-
 # Initialize the Anthropic client
 anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
 if not anthropic_api_key:
@@ -233,8 +274,6 @@ if not tavily_api_key:
 tavily = TavilyClient(api_key=tavily_api_key)
 
 console = Console()
-
-
 
 # Token tracking variables
 main_model_tokens = {'input': 0, 'output': 0, 'cache_write': 0, 'cache_read': 0}
@@ -258,9 +297,6 @@ code_editor_files = set()
 
 # automode flag
 automode = False
-
-# Store file contents
-file_contents = {}
 
 # Global dictionary to store running processes
 running_processes = {}
@@ -288,6 +324,7 @@ You are Claude, an AI assistant powered by Anthropic's Claude-3.5-Sonnet model, 
 6. Performing web searches for up-to-date information
 7. Executing code and analyzing its output within an isolated 'code_execution_env' virtual environment
 8. Managing and stopping running processes started within the 'code_execution_env'
+9. Running shell commands.
 </capabilities>
 
 Available tools and their optimal use cases:
@@ -301,6 +338,23 @@ Available tools and their optimal use cases:
    - Include ALL the snippets of code to change, along with the desired modifications.
    - Specify coding standards, naming conventions, or architectural patterns to be followed.
    - Anticipate potential issues or conflicts that might arise from the changes and provide guidance on how to handle them.
+   - IMPORTANT: Always provide the input in the following format:
+     {
+    "files": [
+        {
+            "path": "app/templates/base.html",
+            "instructions": "Update the navigation bar for better UX."
+        },
+        {
+            "path": "app/routes.py",
+            "instructions": "Refactor the route handling for scalability."
+        }
+    ],
+    "project_context": "Overall context about the project and desired changes."
+}
+
+   - Ensure that the "files" key contains a list of dictionaries, even if you're only editing one file.
+   - Always include the "project_context" key with relevant information.
 4. execute_code: Run Python code exclusively in the 'code_execution_env' virtual environment and analyze its output. Use this when you need to test code functionality or diagnose issues. Remember that all code execution happens in this isolated environment. This tool returns a process ID for long-running processes.
 5. stop_process: Stop a running process by its ID. Use this when you need to terminate a long-running process started by the execute_code tool.
 6. read_multiple_files: Read the contents of one or more existing files, supporting wildcards (e.g., '*.py') and recursive directory reading. This tool can handle single or multiple file paths, directory paths, and wildcard patterns. Use this when you need to examine or work with file contents, especially for multiple files or entire directories.
@@ -347,8 +401,9 @@ Always strive for accuracy, clarity, and efficiency in your responses and action
 When using tools:
 1. Carefully consider if a tool is necessary before using it.
 2. Ensure all required parameters are provided and valid.
-3. Handle both successful results and errors gracefully.
-4. Provide clear explanations of tool usage and results to the user.
+3. When using edit_and_apply_multiple, always structure your input as a dictionary with "files" (a list of file dictionaries) and "project_context" keys.
+4. Handle both successful results and errors gracefully.
+5. Provide clear explanations of tool usage and results to the user.
 </tool_usage_best_practices>
 
 Remember, you are an AI assistant, and your primary goal is to help the user accomplish their tasks effectively and efficiently while maintaining the integrity and security of their development environment.
@@ -459,6 +514,11 @@ def update_system_prompt(current_iteration: Optional[int] = None, max_iterations
     Answer the user's request using relevant tools (if they are available). Before calling a tool, do some analysis within <thinking></thinking> tags. First, think about which of the provided tools is the relevant tool to answer the user's request. Second, go through each of the required parameters of the relevant tool and determine if the user has directly provided or given enough information to infer a value. When deciding if the parameter can be inferred, carefully consider all the context to see if it supports a specific value. If all of the required parameters are present or can be reasonably inferred, close the thinking tag and proceed with the tool call. BUT, if one of the values for a required parameter is missing, DO NOT invoke the function (not even with fillers for the missing params) and instead, ask the user to provide the missing parameters. DO NOT ask for more information on optional parameters if it is not provided.
 
     Do not reflect on the quality of the returned search results in your response.
+
+    IMPORTANT: Before using the read_multiple_files tool, always check if the files you need are already in your context (system prompt).
+    If the file contents are already available to you, use that information directly instead of calling the read_multiple_files tool.
+    Only use the read_multiple_files tool for files that are not already in your context.
+    When instructing to read a file, always use the full file path.
     """
 
     files_in_context = "\n".join(file_contents.keys())
@@ -530,59 +590,77 @@ def create_files(files):
 async def generate_edit_instructions(file_path, file_content, instructions, project_context, full_file_contents):
     global code_editor_tokens, code_editor_memory, code_editor_files
     try:
-        # Prepare memory context (this is the only part that maintains some context between calls)
+        # Prepare memory context (maintains some context between calls)
         memory_context = "\n".join([f"Memory {i+1}:\n{mem}" for i, mem in enumerate(code_editor_memory)])
-
+    
         # Prepare full file contents context, excluding the file being edited if it's already in code_editor_files
         full_file_contents_context = "\n\n".join([
             f"--- {path} ---\n{content}" for path, content in full_file_contents.items()
             if path != file_path or path not in code_editor_files
         ])
-
+    
         system_prompt = f"""
-        You are an AI coding agent that generates edit instructions for code files. Your task is to analyze the provided code and generate SEARCH/REPLACE blocks for necessary changes. Follow these steps:
-
-        1. Review the entire file content to understand the context:
+        You are an expert coding assistant specializing in web development (CSS, JavaScript, React, Tailwind, Node.JS, Hugo/Markdown). Review the following information carefully:
+    
+        1. File Content:
         {file_content}
-
-        2. Carefully analyze the specific instructions:
+    
+        2. Edit Instructions:
         {instructions}
-
-        3. Take into account the overall project context:
+    
+        3. Project Context:
         {project_context}
-
-        4. Consider the memory of previous edits:
+    
+        4. Previous Edit Memory:
         {memory_context}
-
-        5. Consider the full context of all files in the project:
+    
+        5. Full Project Files Context:
         {full_file_contents_context}
-
-        6. Generate SEARCH/REPLACE blocks for each necessary change. Each block should:
-           - Include enough context to uniquely identify the code to be changed
-           - Provide the exact replacement code, maintaining correct indentation and formatting
-           - Focus on specific, targeted changes rather than large, sweeping modifications
-
-        7. Ensure that your SEARCH/REPLACE blocks:
-           - Address all relevant aspects of the instructions
-           - Maintain or enhance code readability and efficiency
-           - Consider the overall structure and purpose of the code
-           - Follow best practices and coding standards for the language
-           - Maintain consistency with the project context and previous edits
-           - Take into account the full context of all files in the project
-
-        IMPORTANT: RETURN ONLY THE SEARCH/REPLACE BLOCKS. NO EXPLANATIONS OR COMMENTS.
-        USE THE FOLLOWING FORMAT FOR EACH BLOCK:
-
+    
+        Follow this process to generate edit instructions:
+    
+        1. <CODE_REVIEW>
+        Analyze the existing code thoroughly. Describe how it works, identifying key components, 
+        dependencies, and potential issues. Consider the broader project context and previous edits.
+        </CODE_REVIEW>
+    
+        2. <PLANNING>
+        Construct a plan to implement the requested changes. Consider:
+        - How to avoid code duplication (DRY principle)
+        - Balance between maintenance and flexibility
+        - Relevant frameworks or libraries
+        - Security implications
+        - Performance impacts
+        Outline discrete changes and suggest small tests for each stage.
+        </PLANNING>
+    
+        3. Finally, generate SEARCH/REPLACE blocks for each necessary change:
+        - Use enough context to uniquely identify the code to be changed
+        - Maintain correct indentation and formatting
+        - Focus on specific, targeted changes
+        - Ensure consistency with project context and previous edits
+    
+        USE THIS FORMAT FOR CHANGES:
+    
         <SEARCH>
-        Code to be replaced
+        Code to be replaced (with sufficient context)
         </SEARCH>
         <REPLACE>
         New code to insert
         </REPLACE>
-
-        If no changes are needed, return an empty list.
+    
+        IMPORTANT: ONLY RETURN CODE INSIDE THE <SEARCH> AND <REPLACE> TAGS. DO NOT INCLUDE ANY OTHER TEXT, COMMENTS, or Explanations. FOR EXAMPLE:
+    
+        <SEARCH>
+        def old_function():
+            pass
+        </SEARCH>
+        <REPLACE>
+        def new_function():
+            print("New Functionality")
+        </REPLACE>
         """
-
+    
         response = client.beta.prompt_caching.messages.create(
             model=CODEEDITORMODEL,
             max_tokens=8000,
@@ -598,27 +676,75 @@ async def generate_edit_instructions(file_path, file_content, instructions, proj
             ],
             extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"}
         )
+    
         # Update token usage for code editor
         code_editor_tokens['input'] += response.usage.input_tokens
         code_editor_tokens['output'] += response.usage.output_tokens
-        code_editor_tokens['cache_creation'] = response.usage.cache_creation_input_tokens
+        code_editor_tokens['cache_write'] = response.usage.cache_creation_input_tokens
         code_editor_tokens['cache_read'] = response.usage.cache_read_input_tokens
-
+    
+        ai_response_text = response.content[0].text  # Extract the text
+    
+        # If ai_response_text is a list, handle it
+        if isinstance(ai_response_text, list):
+            ai_response_text = ' '.join(
+                item['text'] if isinstance(item, dict) and 'text' in item else str(item)
+                for item in ai_response_text
+            )
+        elif not isinstance(ai_response_text, str):
+            ai_response_text = str(ai_response_text)
+    
+        # Validate AI response
+        try:
+            if not validate_ai_response(ai_response_text):
+                raise ValueError("AI response does not contain valid SEARCH/REPLACE blocks")
+        except ValueError as ve:
+            logging.error(f"Validation failed: {ve}")
+            return []  # Return empty list to indicate failure
+    
         # Parse the response to extract SEARCH/REPLACE blocks
-        edit_instructions = parse_search_replace_blocks(response.content[0].text)
-
-        # Update code editor memory (this is the only part that maintains some context between calls)
-        code_editor_memory.append(f"Edit Instructions for {file_path}:\n{response.content[0].text}")
-
+        edit_instructions = parse_search_replace_blocks(ai_response_text)
+    
+        if not edit_instructions:
+            raise ValueError("No valid edit instructions were generated")
+    
+        # Update code editor memory
+        code_editor_memory.append(f"Edit Instructions for {file_path}:\n{ai_response_text}")
+    
         # Add the file to code_editor_files set
         code_editor_files.add(file_path)
-
+    
         return edit_instructions
 
     except Exception as e:
         console.print(f"Error in generating edit instructions: {str(e)}", style="bold red")
+        logging.error(f"Error in generating edit instructions: {str(e)}")
         return []  # Return empty list if any exception occurs
 
+
+def validate_ai_response(response_text):
+    if isinstance(response_text, list):
+        # Extract 'text' from each dictionary in the list
+        try:
+            response_text = ' '.join(
+                item['text'] if isinstance(item, dict) and 'text' in item else str(item)
+                for item in response_text
+            )
+        except Exception as e:
+            logging.error(f"Error processing response_text list: {str(e)}")
+            raise ValueError("Invalid format in response_text list.")
+    elif not isinstance(response_text, str):
+        logging.debug(f"validate_ai_response received type {type(response_text)}: {response_text}")
+        raise ValueError(f"Invalid type for response_text: {type(response_text)}. Expected string.")
+    
+    # Log the processed response_text
+    logging.debug(f"Processed response_text for validation: {response_text}")
+    
+    if not re.search(r'<SEARCH>.*?</SEARCH>', response_text, re.DOTALL):
+        raise ValueError("AI response does not contain any <SEARCH> blocks")
+    if not re.search(r'<REPLACE>.*?</REPLACE>', response_text, re.DOTALL):
+        raise ValueError("AI response does not contain any <REPLACE> blocks")
+    return True
 
 
 def parse_search_replace_blocks(response_text, use_fuzzy=USE_FUZZY_SEARCH):
@@ -642,8 +768,11 @@ def parse_search_replace_blocks(response_text, use_fuzzy=USE_FUZZY_SEARCH):
         similarity = 1.0  # Default to exact match
 
         if use_fuzzy and search not in response_text:
-            # Implement fuzzy matching logic here
-            best_match = difflib.get_close_matches(search, [response_text], n=1, cutoff=0.6)
+            # Extract possible search targets from the response text
+            possible_search_targets = re.findall(r'<SEARCH>\s*(.*?)\s*</SEARCH>', response_text, re.DOTALL)
+            possible_search_targets = [target.strip() for target in possible_search_targets]
+            
+            best_match = difflib.get_close_matches(search, possible_search_targets, n=1, cutoff=0.6)
             if best_match:
                 similarity = difflib.SequenceMatcher(None, search, best_match[0]).ratio()
             else:
@@ -663,9 +792,14 @@ async def edit_and_apply_multiple(files, project_context, is_automode=False):
     results = []
     console_outputs = []
 
-    # Ensure files is always a list
-    if isinstance(files, dict):
-        files = [files]
+    logging.debug(f"edit_and_apply_multiple called with files: {files}")
+    logging.debug(f"Project context: {project_context}")
+
+    try:
+        files = validate_files_structure(files)
+    except ValueError as ve:
+        logging.error(f"Validation error: {ve}")
+        return [], f"Error: {ve}"
 
     logging.info(f"Starting edit_and_apply_multiple with {len(files)} file(s)")
 
@@ -684,6 +818,11 @@ async def edit_and_apply_multiple(files, project_context, is_automode=False):
             logging.info(f"Generating edit instructions for file: {path}")
             edit_instructions = await generate_edit_instructions(path, original_content, instructions, project_context, file_contents)
 
+            logging.debug(f"AI response for {path}: {edit_instructions}")
+
+            if not isinstance(edit_instructions, list) or not all(isinstance(item, dict) for item in edit_instructions):
+                raise ValueError("Invalid edit_instructions format. Expected a list of dictionaries.")
+
             if edit_instructions:
                 console.print(Panel(f"File: {path}\nThe following SEARCH/REPLACE blocks have been generated:", title="Edit Instructions", style="cyan"))
                 for i, block in enumerate(edit_instructions, 1):
@@ -692,6 +831,7 @@ async def edit_and_apply_multiple(files, project_context, is_automode=False):
 
                 logging.info(f"Applying edits to file: {path}")
                 edited_content, changes_made, failed_edits, console_output = await apply_edits(path, edit_instructions, original_content)
+
                 console_outputs.append(console_output)
 
                 if changes_made:
@@ -701,6 +841,7 @@ async def edit_and_apply_multiple(files, project_context, is_automode=False):
 
                     if failed_edits:
                         logging.warning(f"Some edits failed for file: {path}")
+                        logging.debug(f"Failed edits for {path}: {failed_edits}")
                         results.append({
                             "path": path,
                             "status": "partial_success",
@@ -731,6 +872,7 @@ async def edit_and_apply_multiple(files, project_context, is_automode=False):
                 })
         except Exception as e:
             logging.error(f"Error editing/applying to file {path}: {str(e)}")
+            logging.exception("Full traceback:")
             error_message = f"Error editing/applying to file {path}: {str(e)}"
             results.append({
                 "path": path,
@@ -740,6 +882,7 @@ async def edit_and_apply_multiple(files, project_context, is_automode=False):
             console_outputs.append(error_message)
 
     logging.info("Completed edit_and_apply_multiple")
+    logging.debug(f"Results: {results}")
     return results, "\n".join(console_outputs)
 
 
@@ -777,11 +920,9 @@ async def apply_edits(file_path, edit_instructions, original_content):
                         match = re.search(re.escape(best_match[0]), edited_content)
 
                 if match:
-                    # Replace the content, preserving the original whitespace
-                    start, end = match.span()
-                    # Strip <SEARCH> and <REPLACE> tags from replace_content
+                    # Replace the content using re.sub for more robust replacement
                     replace_content_cleaned = re.sub(r'</?SEARCH>|</?REPLACE>', '', replace_content)
-                    edited_content = edited_content[:start] + replace_content_cleaned + edited_content[end:]
+                    edited_content = pattern.sub(replace_content_cleaned, edited_content, count=1)
                     changes_made = True
 
                     # Display the diff for this edit
@@ -813,7 +954,7 @@ async def apply_edits(file_path, edit_instructions, original_content):
         console_output.append(message)
         console.print(Panel(message, style="green"))
 
-    return edited_content, changes_made, "\n".join(failed_edits), "\n".join(console_output)
+    return edited_content, changes_made, failed_edits, "\n".join(console_output)
 
 
 def highlight_diff(diff_text):
@@ -907,26 +1048,28 @@ def read_multiple_files(paths, recursive=False):
 
     for path in paths:
         try:
-            if os.path.isdir(path):
+            abs_path = os.path.abspath(path)
+            if os.path.isdir(abs_path):
                 if recursive:
-                    file_paths = glob.glob(os.path.join(path, '**', '*'), recursive=True)
+                    file_paths = glob.glob(os.path.join(abs_path, '**', '*'), recursive=True)
                 else:
-                    file_paths = glob.glob(os.path.join(path, '*'))
+                    file_paths = glob.glob(os.path.join(abs_path, '*'))
                 file_paths = [f for f in file_paths if os.path.isfile(f)]
             else:
-                file_paths = glob.glob(path, recursive=recursive)
+                file_paths = glob.glob(abs_path, recursive=recursive)
 
             for file_path in file_paths:
-                if os.path.isfile(file_path):
-                    if file_path not in file_contents:
-                        with open(file_path, 'r', encoding='utf-8') as f:
+                abs_file_path = os.path.abspath(file_path)
+                if os.path.isfile(abs_file_path):
+                    if abs_file_path not in file_contents:
+                        with open(abs_file_path, 'r', encoding='utf-8') as f:
                             content = f.read()
-                        file_contents[file_path] = content
-                        results.append(f"File '{file_path}' has been read and stored in the system prompt.")
+                        file_contents[abs_file_path] = content
+                        results.append(f"File '{abs_file_path}' has been read and stored in the system prompt.")
                     else:
-                        results.append(f"File '{file_path}' is already in the system prompt. No need to read again.")
+                        results.append(f"File '{abs_file_path}' is already in the system prompt. No need to read again.")
                 else:
-                    results.append(f"Skipped '{file_path}': Not a file.")
+                    results.append(f"Skipped '{abs_file_path}': Not a file.")
         except Exception as e:
             results.append(f"Error reading path '{path}': {str(e)}")
 
@@ -978,6 +1121,169 @@ def run_shell_command(command):
         return {
             "error": f"An error occurred while executing the command: {str(e)}"
         }
+    
+def validate_files_structure(files):
+    if not isinstance(files, (dict, list)):
+        raise ValueError("Invalid 'files' structure. Expected a dictionary or a list of dictionaries.")
+    
+    if isinstance(files, dict):
+        files = [files]
+    
+    for file in files:
+        if not isinstance(file, dict):
+            raise ValueError("Each file must be a dictionary.")
+        if 'path' not in file or 'instructions' not in file:
+            raise ValueError("Each file dictionary must contain 'path' and 'instructions' keys.")
+        if not isinstance(file['path'], str) or not isinstance(file['instructions'], str):
+            raise ValueError("'path' and 'instructions' must be strings.")
+
+    return files
+
+def scan_folder(folder_path: str, output_file: str) -> str:
+    ignored_folders = {'.git', '__pycache__', 'node_modules', 'venv', 'env'}
+    markdown_content = f"# Folder Scan: {folder_path}\n\n"
+    total_chars = len(markdown_content)
+    max_chars = 600000  # Approximating 150,000 tokens
+
+    for root, dirs, files in os.walk(folder_path):
+        dirs[:] = [d for d in dirs if d not in ignored_folders]
+
+        for file in files:
+            file_path = os.path.join(root, file)
+            relative_path = os.path.relpath(file_path, folder_path)
+
+            mime_type, _ = mimetypes.guess_type(file_path)
+            if mime_type and mime_type.startswith('text'):
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        content = f.read()
+
+                    file_content = f"## {relative_path}\n\n```\n{content}\n```\n\n"
+                    if total_chars + len(file_content) > max_chars:
+                        remaining_chars = max_chars - total_chars
+                        if remaining_chars > 0:
+                            truncated_content = file_content[:remaining_chars]
+                            markdown_content += truncated_content
+                            markdown_content += "\n\n... Content truncated due to size limitations ...\n"
+                        else:
+                            markdown_content += "\n\n... Additional files omitted due to size limitations ...\n"
+                        break
+                    else:
+                        markdown_content += file_content
+                        total_chars += len(file_content)
+                except Exception as e:
+                    error_msg = f"## {relative_path}\n\nError reading file: {str(e)}\n\n"
+                    if total_chars + len(error_msg) <= max_chars:
+                        markdown_content += error_msg
+                        total_chars += len(error_msg)
+
+        if total_chars >= max_chars:
+            break
+
+    with open(output_file, 'w', encoding='utf-8') as f:
+        f.write(markdown_content)
+
+    return f"Folder scan complete. Markdown file created at: {output_file}. Total characters: {total_chars}"
+
+def encode_image_to_base64(image_path):
+    try:
+        with Image.open(image_path) as img:
+            max_size = (1024, 1024)
+            img.thumbnail(max_size, Image.DEFAULT_STRATEGY)
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+            img_byte_arr = io.BytesIO()
+            img.save(img_byte_arr, format='JPEG')
+            return base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
+    except Exception as e:
+        return f"Error encoding image: {str(e)}"
+
+
+async def send_to_ai_for_executing(code, execution_result):
+    global code_execution_tokens
+
+    try:
+        system_prompt = f"""
+        You are an AI code execution agent. Your task is to analyze the provided code and its execution result from the 'code_execution_env' virtual environment, then provide a concise summary of what worked, what didn't work, and any important observations. Follow these steps:
+
+        1. Review the code that was executed in the 'code_execution_env' virtual environment:
+        {code}
+
+        2. Analyze the execution result from the 'code_execution_env' virtual environment:
+        {execution_result}
+
+        3. Provide a brief summary of:
+           - What parts of the code executed successfully in the virtual environment
+           - Any errors or unexpected behavior encountered in the virtual environment
+           - Potential improvements or fixes for issues, considering the isolated nature of the environment
+           - Any important observations about the code's performance or output within the virtual environment
+           - If the execution timed out, explain what this might mean (e.g., long-running process, infinite loop)
+
+        Be concise and focus on the most important aspects of the code execution within the 'code_execution_env' virtual environment.
+
+        IMPORTANT: PROVIDE ONLY YOUR ANALYSIS AND OBSERVATIONS. DO NOT INCLUDE ANY PREFACING STATEMENTS OR EXPLANATIONS OF YOUR ROLE.
+        """
+
+        response = client.beta.prompt_caching.messages.create(
+            model=CODEEXECUTIONMODEL,
+            max_tokens=2000,
+            system=[
+                {
+                    "type": "text",
+                    "text": system_prompt,
+                    "cache_control": {"type": "ephemeral"}
+                }
+            ],
+            messages=[
+                {"role": "user", "content": f"Analyze this code execution from the 'code_execution_env' virtual environment:\n\nCode:\n{code}\n\nExecution Result:\n{execution_result}"}
+            ],
+            extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"}
+        )
+
+        # Update token usage for code execution
+        code_execution_tokens['input'] += response.usage.input_tokens
+        code_execution_tokens['output'] += response.usage.output_tokens
+        code_execution_tokens['cache_creation'] = response.usage.cache_creation_input_tokens
+        code_execution_tokens['cache_read'] = response.usage.cache_read_input_tokens
+
+        analysis = response.content[0].text
+
+        return analysis
+
+    except Exception as e:
+        console.print(f"Error in AI code execution analysis: {str(e)}", style="bold red")
+        return f"Error analyzing code execution from 'code_execution_env': {str(e)}"
+
+
+def save_chat():
+    # Generate filename
+    now = datetime.datetime.now()
+    filename = f"Chat_{now.strftime('%H%M')}.md"
+
+    # Format conversation history
+    formatted_chat = "# Claude-3-Sonnet Engineer Chat Log\n\n"
+    for message in conversation_history:
+        if message['role'] == 'user':
+            formatted_chat += f"## User\n\n{message['content']}\n\n"
+        elif message['role'] == 'assistant':
+            if isinstance(message['content'], str):
+                formatted_chat += f"## Claude\n\n{message['content']}\n\n"
+            elif isinstance(message['content'], list):
+                for content in message['content']:
+                    if content['type'] == 'tool_use':
+                        formatted_chat += f"### Tool Use: {content['name']}\n\n```json\n{json.dumps(content['input'], indent=2)}\n```\n\n"
+                    elif content['type'] == 'text':
+                        formatted_chat += f"## Claude\n\n{content['text']}\n\n"
+        elif message['role'] == 'user' and isinstance(message['content'], list):
+            for content in message['content']:
+                if content['type'] == 'tool_result':
+                    formatted_chat += f"### Tool Result\n\n```\n{content['content']}\n```\n\n"
+
+    # Save to file
+    with open(filename, 'w', encoding='utf-8') as f:
+        f.write(formatted_chat)
+
+    return filename
 
 
 tools = [
@@ -1188,8 +1494,12 @@ tools = [
 
 
 
-async def decide_retry(tool_checker_response, edit_results):
+async def decide_retry(tool_checker_response, edit_results, tool_input):
     try:
+        if not edit_results:
+            console.print(Panel("No edits were made or an error occurred. Skipping retry.", title="Info", style="bold yellow"))
+            return {"retry": False, "files_to_retry": []}
+
         response = client.messages.create(
             model=TOOLCHECKERMODEL,
             max_tokens=1000,
@@ -1207,29 +1517,51 @@ Only return the JSON object, nothing else. Ensure that the JSON is properly form
             ]
         )
         
-        # Extract the text content from the response
         response_text = response.content[0].text.strip()
         
-        # Try to find a valid JSON object within the response
-        json_start = response_text.find('{')
-        json_end = response_text.rfind('}') + 1
-        if json_start != -1 and json_end != -1:
-            json_str = response_text[json_start:json_end]
-            decision = json.loads(json_str)
-        else:
-            # If no valid JSON found, make a decision based on the presence of "retry" in the response
+        # Handle list of dicts if necessary
+        if isinstance(response_text, list):
+            response_text = ' '.join(
+                item['text'] if isinstance(item, dict) and 'text' in item else str(item)
+                for item in response_text
+            )
+        elif not isinstance(response_text, str):
+            response_text = str(response_text)
+        
+        try:
+            decision = json.loads(response_text)
+        except json.JSONDecodeError:
+            console.print(Panel("Failed to parse JSON from AI response. Using fallback decision.", title="Warning", style="bold yellow"))
             decision = {
                 "retry": "retry" in response_text.lower(),
                 "files_to_retry": []
             }
         
-        return {
+        files = tool_input.get('files', [])
+        if isinstance(files, dict):
+            files = [files]
+        elif not isinstance(files, list):
+            console.print(Panel("Error: 'files' must be a dictionary or a list of dictionaries.", title="Error", style="bold red"))
+            return {"retry": False, "files_to_retry": []}
+        
+        if not all(isinstance(item, dict) for item in files):
+            console.print(Panel("Error: Each file must be a dictionary with 'path' and 'instructions'.", title="Error", style="bold red"))
+            return {"retry": False, "files_to_retry": []}
+        
+        valid_file_paths = set(file['path'] for file in files)
+        files_to_retry = [
+            file_path for file_path in decision.get("files_to_retry", [])
+            if file_path in valid_file_paths
+        ]
+        
+        retry_decision = {
             "retry": decision.get("retry", False),
-            "files_to_retry": decision.get("files_to_retry", [])
+            "files_to_retry": files_to_retry
         }
-    except json.JSONDecodeError as e:
-        console.print(Panel(f"Error parsing JSON in decide_retry: {str(e)}", title="Error", style="bold red"))
-        return {"retry": False, "files_to_retry": []}
+        
+        console.print(Panel(f"Retry decision: {json.dumps(retry_decision, indent=2)}", title="Retry Decision", style="bold cyan"))
+        return retry_decision
+
     except Exception as e:
         console.print(Panel(f"Error in decide_retry: {str(e)}", title="Error", style="bold red"))
         return {"retry": False, "files_to_retry": []}
@@ -1247,8 +1579,45 @@ async def execute_tool(tool_name: str, tool_input: Dict[str, Any]) -> Dict[str, 
                 files = tool_input
             result = create_files(files)
         elif tool_name == "edit_and_apply_multiple":
-            files = tool_input.get("files", [tool_input])
-            result, console_output = await edit_and_apply_multiple(files, tool_input["project_context"], is_automode=automode)
+            files = tool_input.get("files")
+            if not files:
+                result = "Error: 'files' key is missing or empty."
+                is_error = True
+            else:
+                # Ensure 'files' is a list of dictionaries
+                if isinstance(files, str):
+                    try:
+                        # Attempt to parse the JSON string
+                        files = json.loads(files)
+                        if isinstance(files, dict):
+                            files = [files]
+                        elif isinstance(files, list):
+                            if not all(isinstance(file, dict) for file in files):
+                                result = "Error: Each file must be a dictionary with 'path' and 'instructions'."
+                                is_error = True
+                    except json.JSONDecodeError:
+                        result = "Error: 'files' must be a dictionary or a list of dictionaries, and should not be a string."
+                        is_error = True
+                elif isinstance(files, dict):
+                    files = [files]
+                elif isinstance(files, list):
+                    if not all(isinstance(file, dict) for file in files):
+                        result = "Error: Each file must be a dictionary with 'path' and 'instructions'."
+                        is_error = True
+                else:
+                    result = "Error: 'files' must be a dictionary or a list of dictionaries."
+                    is_error = True
+
+                if not is_error:
+                    # Validate the structure of 'files'
+                    try:
+                        files = validate_files_structure(files)
+                    except ValueError as ve:
+                        result = f"Error: {str(ve)}"
+                        is_error = True
+
+            if not is_error:
+                result, console_output = await edit_and_apply_multiple(files, tool_input["project_context"], is_automode=automode)
         elif tool_name == "create_folders":
             result = create_folders(tool_input["paths"])
         elif tool_name == "read_multiple_files":
@@ -1263,11 +1632,6 @@ async def execute_tool(tool_name: str, tool_input: Dict[str, Any]) -> Dict[str, 
                     result = "All requested files are already in the system prompt. No need to read from disk."
                 else:
                     result = read_multiple_files(files_to_read, recursive)
-            if paths is None:
-                result = "Error: No file paths provided"
-                is_error = True
-            else:
-                result = read_multiple_files(paths)
         elif tool_name == "list_files":
             result = list_files(tool_input.get("path", "."))
         elif tool_name == "tavily_search":
@@ -1276,8 +1640,11 @@ async def execute_tool(tool_name: str, tool_input: Dict[str, Any]) -> Dict[str, 
             result = stop_process(tool_input["process_id"])
         elif tool_name == "execute_code":
             process_id, execution_result = await execute_code(tool_input["code"])
-            analysis_task = asyncio.create_task(send_to_ai_for_executing(tool_input["code"], execution_result))
-            analysis = await analysis_task
+            if execution_result.startswith("Process started and running"):
+                analysis = "The process is still running in the background."
+            else:
+                analysis_task = asyncio.create_task(send_to_ai_for_executing(tool_input["code"], execution_result))
+                analysis = await analysis_task
             result = f"{execution_result}\n\nAnalysis:\n{analysis}"
             if process_id in running_processes:
                 result += "\n\nNote: The process is still running in the background."
@@ -1308,152 +1675,6 @@ async def execute_tool(tool_name: str, tool_input: Dict[str, Any]) -> Dict[str, 
             "is_error": True,
             "console_output": None
         }
-
-def scan_folder(folder_path: str, output_file: str) -> str:
-    ignored_folders = {'.git', '__pycache__', 'node_modules', 'venv', 'env'}
-    markdown_content = f"# Folder Scan: {folder_path}\n\n"
-    total_chars = len(markdown_content)
-    max_chars = 600000  # Approximating 150,000 tokens
-
-    for root, dirs, files in os.walk(folder_path):
-        dirs[:] = [d for d in dirs if d not in ignored_folders]
-
-        for file in files:
-            file_path = os.path.join(root, file)
-            relative_path = os.path.relpath(file_path, folder_path)
-
-            mime_type, _ = mimetypes.guess_type(file_path)
-            if mime_type and mime_type.startswith('text'):
-                try:
-                    with open(file_path, 'r', encoding='utf-8') as f:
-                        content = f.read()
-
-                    file_content = f"## {relative_path}\n\n```\n{content}\n```\n\n"
-                    if total_chars + len(file_content) > max_chars:
-                        remaining_chars = max_chars - total_chars
-                        if remaining_chars > 0:
-                            truncated_content = file_content[:remaining_chars]
-                            markdown_content += truncated_content
-                            markdown_content += "\n\n... Content truncated due to size limitations ...\n"
-                        else:
-                            markdown_content += "\n\n... Additional files omitted due to size limitations ...\n"
-                        break
-                    else:
-                        markdown_content += file_content
-                        total_chars += len(file_content)
-                except Exception as e:
-                    error_msg = f"## {relative_path}\n\nError reading file: {str(e)}\n\n"
-                    if total_chars + len(error_msg) <= max_chars:
-                        markdown_content += error_msg
-                        total_chars += len(error_msg)
-
-        if total_chars >= max_chars:
-            break
-
-    with open(output_file, 'w', encoding='utf-8') as f:
-        f.write(markdown_content)
-
-    return f"Folder scan complete. Markdown file created at: {output_file}. Total characters: {total_chars}"
-
-def encode_image_to_base64(image_path):
-    try:
-        with Image.open(image_path) as img:
-            max_size = (1024, 1024)
-            img.thumbnail(max_size, Image.DEFAULT_STRATEGY)
-            if img.mode != 'RGB':
-                img = img.convert('RGB')
-            img_byte_arr = io.BytesIO()
-            img.save(img_byte_arr, format='JPEG')
-            return base64.b64encode(img_byte_arr.getvalue()).decode('utf-8')
-    except Exception as e:
-        return f"Error encoding image: {str(e)}"
-
-
-async def send_to_ai_for_executing(code, execution_result):
-    global code_execution_tokens
-
-    try:
-        system_prompt = f"""
-        You are an AI code execution agent. Your task is to analyze the provided code and its execution result from the 'code_execution_env' virtual environment, then provide a concise summary of what worked, what didn't work, and any important observations. Follow these steps:
-
-        1. Review the code that was executed in the 'code_execution_env' virtual environment:
-        {code}
-
-        2. Analyze the execution result from the 'code_execution_env' virtual environment:
-        {execution_result}
-
-        3. Provide a brief summary of:
-           - What parts of the code executed successfully in the virtual environment
-           - Any errors or unexpected behavior encountered in the virtual environment
-           - Potential improvements or fixes for issues, considering the isolated nature of the environment
-           - Any important observations about the code's performance or output within the virtual environment
-           - If the execution timed out, explain what this might mean (e.g., long-running process, infinite loop)
-
-        Be concise and focus on the most important aspects of the code execution within the 'code_execution_env' virtual environment.
-
-        IMPORTANT: PROVIDE ONLY YOUR ANALYSIS AND OBSERVATIONS. DO NOT INCLUDE ANY PREFACING STATEMENTS OR EXPLANATIONS OF YOUR ROLE.
-        """
-
-        response = client.beta.prompt_caching.messages.create(
-            model=CODEEXECUTIONMODEL,
-            max_tokens=2000,
-            system=[
-                {
-                    "type": "text",
-                    "text": system_prompt,
-                    "cache_control": {"type": "ephemeral"}
-                }
-            ],
-            messages=[
-                {"role": "user", "content": f"Analyze this code execution from the 'code_execution_env' virtual environment:\n\nCode:\n{code}\n\nExecution Result:\n{execution_result}"}
-            ],
-            extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"}
-        )
-
-        # Update token usage for code execution
-        code_execution_tokens['input'] += response.usage.input_tokens
-        code_execution_tokens['output'] += response.usage.output_tokens
-        code_execution_tokens['cache_creation'] = response.usage.cache_creation_input_tokens
-        code_execution_tokens['cache_read'] = response.usage.cache_read_input_tokens
-
-        analysis = response.content[0].text
-
-        return analysis
-
-    except Exception as e:
-        console.print(f"Error in AI code execution analysis: {str(e)}", style="bold red")
-        return f"Error analyzing code execution from 'code_execution_env': {str(e)}"
-
-
-def save_chat():
-    # Generate filename
-    now = datetime.datetime.now()
-    filename = f"Chat_{now.strftime('%H%M')}.md"
-
-    # Format conversation history
-    formatted_chat = "# Claude-3-Sonnet Engineer Chat Log\n\n"
-    for message in conversation_history:
-        if message['role'] == 'user':
-            formatted_chat += f"## User\n\n{message['content']}\n\n"
-        elif message['role'] == 'assistant':
-            if isinstance(message['content'], str):
-                formatted_chat += f"## Claude\n\n{message['content']}\n\n"
-            elif isinstance(message['content'], list):
-                for content in message['content']:
-                    if content['type'] == 'tool_use':
-                        formatted_chat += f"### Tool Use: {content['name']}\n\n```json\n{json.dumps(content['input'], indent=2)}\n```\n\n"
-                    elif content['type'] == 'text':
-                        formatted_chat += f"## Claude\n\n{content['text']}\n\n"
-        elif message['role'] == 'user' and isinstance(message['content'], list):
-            for content in message['content']:
-                if content['type'] == 'tool_result':
-                    formatted_chat += f"### Tool Result\n\n```\n{content['content']}\n```\n\n"
-
-    # Save to file
-    with open(filename, 'w', encoding='utf-8') as f:
-        f.write(formatted_chat)
-
-    return filename
 
 
 
@@ -1604,17 +1825,21 @@ async def chat_with_claude(user_input, image_path=None, current_iteration=None, 
         console.print(Panel(f"Tool Used: {tool_name}", style="green"))
         console.print(Panel(f"Tool Input: {json.dumps(tool_input, indent=2)}", style="green"))
 
-        if tool_name == 'create_files':
-            tool_result = create_files(tool_input.get('files', [tool_input]))
-        else:
-            tool_result = await execute_tool(tool_name, tool_input)
+        # Always use execute_tool for all tools
+        tool_result = await execute_tool(tool_name, tool_input)
 
         if isinstance(tool_result, dict) and tool_result.get("is_error"):
             console.print(Panel(tool_result["content"], title="Tool Execution Error", style="bold red"))
+            edit_results = []  # Assign empty list due to error
         else:
-            # Format the tool result content for proper rendering
-            formatted_result = json.dumps(tool_result, indent=2) if isinstance(tool_result, (dict, list)) else str(tool_result)
-            # console.print(Panel(formatted_result, title_align="left", title="Tool Result", style="green"))
+            # Assuming tool_result["content"] is a list of results
+            edit_results = tool_result.get("content", [])
+
+        # Prepare the tool_result_content for conversation history
+        tool_result_content = {
+            "type": "text",
+            "text": json.dumps(tool_result) if isinstance(tool_result, (dict, list)) else str(tool_result)
+        }
 
         current_conversation.append({
             "role": "assistant",
@@ -1628,19 +1853,13 @@ async def chat_with_claude(user_input, image_path=None, current_iteration=None, 
             ]
         })
 
-        # Modify this part to ensure correct structure
-        tool_result_content = {
-            "type": "text",
-            "text": json.dumps(tool_result) if isinstance(tool_result, (dict, list)) else str(tool_result)
-        }
-
         current_conversation.append({
             "role": "user",
             "content": [
                 {
                     "type": "tool_result",
                     "tool_use_id": tool_use_id,
-                    "content": [tool_result_content],  # Wrap the content in a list
+                    "content": [tool_result_content],
                     "is_error": tool_result.get("is_error", False) if isinstance(tool_result, dict) else False
                 }
             ]
@@ -1688,13 +1907,25 @@ async def chat_with_claude(user_input, image_path=None, current_iteration=None, 
 
             # If the tool was edit_and_apply_multiple, let the AI decide whether to retry
             if tool_name == 'edit_and_apply_multiple':
-                retry_decision = await decide_retry(tool_checker_response, edit_results)
-                if retry_decision["retry"]:
+                retry_decision = await decide_retry(tool_checker_response, edit_results, tool_input)
+                if retry_decision["retry"] and retry_decision['files_to_retry']:
                     console.print(Panel(f"AI has decided to retry editing for files: {', '.join(retry_decision['files_to_retry'])}", style="yellow"))
-                    retry_files = [file for file in tool_input['files'] if file['path'] in retry_decision['files_to_retry']]
-                    retry_result, retry_console_output = await edit_and_apply_multiple(retry_files, tool_input['project_context'])
-                    console.print(Panel(retry_console_output, title="Retry Result", style="cyan"))
-                    assistant_response += f"\n\nRetry result: {json.dumps(retry_result, indent=2)}"
+                    retry_files = [
+                        file for file in tool_input['files'] 
+                        if file['path'] in retry_decision['files_to_retry']
+                    ]
+                    
+                    # Ensure 'instructions' are present
+                    for file in retry_files:
+                        if 'instructions' not in file:
+                            file['instructions'] = "Please reapply the previous instructions."
+                    
+                    if retry_files:
+                        retry_result, retry_console_output = await edit_and_apply_multiple(retry_files, tool_input['project_context'])
+                        console.print(Panel(retry_console_output, title="Retry Result", style="cyan"))
+                        assistant_response += f"\n\nRetry result: {json.dumps(retry_result, indent=2)}"
+                    else:
+                        console.print(Panel("No files to retry. Skipping retry.", style="yellow"))
                 else:
                     console.print(Panel("Claude has decided not to retry editing", style="green"))
 
@@ -1722,10 +1953,10 @@ def reset_code_editor_memory():
 def reset_conversation():
     global conversation_history, main_model_tokens, tool_checker_tokens, code_editor_tokens, code_execution_tokens, file_contents, code_editor_files
     conversation_history = []
-    main_model_tokens = {'input': 0, 'output': 0, 'cache_write': 0, 'cache_read': 0}
-    tool_checker_tokens = {'input': 0, 'output': 0, 'cache_write': 0, 'cache_read': 0}
-    code_editor_tokens = {'input': 0, 'output': 0, 'cache_write': 0, 'cache_read': 0}
-    code_execution_tokens = {'input': 0, 'output': 0, 'cache_write': 0, 'cache_read': 0}
+    main_model_tokens = {'input': 0, 'output': 0}
+    tool_checker_tokens = {'input': 0, 'output': 0}
+    code_editor_tokens = {'input': 0, 'output': 0}
+    code_execution_tokens = {'input': 0, 'output': 0}
     file_contents = {}
     code_editor_files = set()
     reset_code_editor_memory()
@@ -1765,10 +1996,10 @@ def display_token_usage():
                           ("Tool Checker", tool_checker_tokens),
                           ("Code Editor", code_editor_tokens),
                           ("Code Execution", code_execution_tokens)]:
-        input_tokens = tokens.get('input', 0)
-        output_tokens = tokens.get('output', 0)
-        cache_write_tokens = tokens.get('cache_write', 0)
-        cache_read_tokens = tokens.get('cache_read', 0)
+        input_tokens = tokens['input']
+        output_tokens = tokens['output']
+        cache_write_tokens = tokens['cache_write']
+        cache_read_tokens = tokens['cache_read']
         total_tokens = input_tokens + output_tokens + cache_write_tokens + cache_read_tokens
 
         total_input += input_tokens
@@ -1984,40 +2215,6 @@ async def main():
             console.print(Panel("Exited automode. Returning to regular chat.", style="green"))
         else:
             response, _ = await chat_with_claude(user_input)
-
-def validate_files_structure(files):
-    if not isinstance(files, (dict, list)):
-        raise ValueError("Invalid 'files' structure. Expected a dictionary or a list of dictionaries.")
-    
-    if isinstance(files, dict):
-        files = [files]
-    
-    for file in files:
-        if not isinstance(file, dict):
-            raise ValueError("Each file must be a dictionary.")
-        if 'path' not in file or 'instructions' not in file:
-            raise ValueError("Each file dictionary must contain 'path' and 'instructions' keys.")
-        if not isinstance(file['path'], str) or not isinstance(file['instructions'], str):
-            raise ValueError("'path' and 'instructions' must be strings.")
-
-    return files
-
-def validate_files_structure(files):
-    if not isinstance(files, (dict, list)):
-        raise ValueError("Invalid 'files' structure. Expected a dictionary or a list of dictionaries.")
-    
-    if isinstance(files, dict):
-        files = [files]
-    
-    for file in files:
-        if not isinstance(file, dict):
-            raise ValueError("Each file must be a dictionary.")
-        if 'path' not in file or 'instructions' not in file:
-            raise ValueError("Each file dictionary must contain 'path' and 'instructions' keys.")
-        if not isinstance(file['path'], str) or not isinstance(file['instructions'], str):
-            raise ValueError("'path' and 'instructions' must be strings.")
-
-    return files
 
 
 
